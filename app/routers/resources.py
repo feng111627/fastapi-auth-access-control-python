@@ -1,15 +1,16 @@
-"""受保护资源入口：按 read/write/manage 作用域控制。"""
+"""受保护资源入口：按 read/write/manage 作用域控制，并按操作分桶限流。"""
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from app.deps import api_rate_limit, require_scope
-
-router = APIRouter(
-    prefix="/resources/documents",
-    tags=["documents"],
-    dependencies=[Depends(api_rate_limit)],
+from app.deps import (
+    doc_manage_rate_limit,
+    doc_read_rate_limit,
+    doc_write_rate_limit,
+    require_scope,
 )
+
+router = APIRouter(prefix="/resources/documents", tags=["documents"])
 
 # 本地内存中的示例资源
 _DOCUMENTS: dict[int, dict] = {
@@ -23,12 +24,12 @@ class DocumentIn(BaseModel):
     body: str
 
 
-@router.get("")
+@router.get("", dependencies=[Depends(doc_read_rate_limit)])
 def list_documents(user: dict = Depends(require_scope("documents:read"))) -> list[dict]:
     return list(_DOCUMENTS.values())
 
 
-@router.get("/{doc_id}")
+@router.get("/{doc_id}", dependencies=[Depends(doc_read_rate_limit)])
 def get_document(
     doc_id: int, user: dict = Depends(require_scope("documents:read"))
 ) -> dict:
@@ -38,7 +39,7 @@ def get_document(
     return doc
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(doc_write_rate_limit)])
 def create_document(
     body: DocumentIn, user: dict = Depends(require_scope("documents:write"))
 ) -> dict:
@@ -48,7 +49,7 @@ def create_document(
     return doc
 
 
-@router.delete("/{doc_id}")
+@router.delete("/{doc_id}", dependencies=[Depends(doc_manage_rate_limit)])
 def delete_document(
     doc_id: int, user: dict = Depends(require_scope("documents:manage"))
 ) -> dict:

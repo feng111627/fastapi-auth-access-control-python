@@ -13,11 +13,18 @@ _bearer = HTTPBearer(auto_error=False)
 
 
 def client_source(request: Request) -> str:
-    """限流口径里的"来源"：优先 X-Forwarded-For 首跳，否则直连 IP。"""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """限流口径里的"来源"：以服务端确认的连接对端为准。
+
+    只有当直连对端属于可信代理（config.TRUSTED_PROXY_HOSTS）时，
+    才采信其转发的 X-Forwarded-For 首跳；否则一律使用连接对端本身，
+    客户端自带的请求头无法左右判定，也就不能借此绕过限流。
+    """
+    peer = request.client.host if request.client else "unknown"
+    if peer in config.TRUSTED_PROXY_HOSTS:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return peer
 
 
 def rate_limit(bucket: str, limit: int, window: int):
@@ -43,9 +50,29 @@ def rate_limit(bucket: str, limit: int, window: int):
 login_rate_limit = rate_limit(
     "login", config.LOGIN_RATE_LIMIT_MAX, config.LOGIN_RATE_LIMIT_WINDOW
 )
-api_rate_limit = rate_limit(
-    "api", config.API_RATE_LIMIT_MAX, config.API_RATE_LIMIT_WINDOW
+refresh_rate_limit = rate_limit(
+    "refresh", config.REFRESH_RATE_LIMIT_MAX, config.REFRESH_RATE_LIMIT_WINDOW
 )
+logout_rate_limit = rate_limit(
+    "logout", config.LOGOUT_RATE_LIMIT_MAX, config.LOGOUT_RATE_LIMIT_WINDOW
+)
+revoke_rate_limit = rate_limit(
+    "revoke", config.REVOKE_RATE_LIMIT_MAX, config.REVOKE_RATE_LIMIT_WINDOW
+)
+# 文档资源按操作分桶：读沿用原 api 口径，写/管理各有独立阈值
+doc_read_rate_limit = rate_limit(
+    "documents:read", config.API_RATE_LIMIT_MAX, config.API_RATE_LIMIT_WINDOW
+)
+doc_write_rate_limit = rate_limit(
+    "documents:write", config.DOC_WRITE_RATE_LIMIT_MAX, config.DOC_WRITE_RATE_LIMIT_WINDOW
+)
+doc_manage_rate_limit = rate_limit(
+    "documents:manage",
+    config.DOC_MANAGE_RATE_LIMIT_MAX,
+    config.DOC_MANAGE_RATE_LIMIT_WINDOW,
+)
+# 兼容旧引用：受保护资源读入口的限流桶
+api_rate_limit = doc_read_rate_limit
 
 
 def current_user(

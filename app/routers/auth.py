@@ -3,11 +3,18 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from app.deps import current_user, login_rate_limit
+from app import config
+from app.deps import (
+    current_user,
+    login_rate_limit,
+    logout_rate_limit,
+    refresh_rate_limit,
+    revoke_rate_limit,
+)
 from app.errors import AuthError
+from app.login_guard import login_guard
 from app.security import (
-    issue_access_token,
-    issue_refresh_token,
+    issue_token_pair,
     revoke_token,
     rotate_refresh_token,
 )
@@ -35,21 +42,44 @@ class LogoutRequest(BaseModel):
     refresh_token: str
 
 
+def _account_locked_response(retry_after: int) -> HTTPException:
+    return HTTPException(
+        status_code=423,
+        detail={
+            "code": "account_locked",
+            "message": f"账号已临时锁定，请 {retry_after} 秒后重试",
+            "retry_after": retry_after,
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
 @router.post("/login", response_model=TokenPair, dependencies=[Depends(login_rate_limit)])
 def login(body: LoginRequest) -> TokenPair:
+    # 账号维度锁定优先于密码校验：锁定期间无论来源、无论密码对错都拒绝
+    remaining = login_guard.locked_remaining(body.username)
+    if remaining > 0:
+        raise _account_locked_response(remaining)
     user = user_store.verify_password(body.username, body.password)
     if user is None:
+        locked_for = login_guard.record_failure(
+            body.username,
+            config.LOGIN_MAX_FAILURES,
+            config.LOGIN_FAILURE_WINDOW_SECONDS,
+            config.LOGIN_LOCK_SECONDS,
+        )
+        if locked_for > 0:
+            raise _account_locked_response(locked_for)
         raise HTTPException(
             status_code=401,
             detail={"code": "invalid_credentials", "message": "用户名或密码错误"},
         )
-    return TokenPair(
-        access_token=issue_access_token(user["username"], user["role"]),
-        refresh_token=issue_refresh_token(user["username"]),
-    )
+    login_guard.record_success(body.username)
+    access_token, refresh_token = issue_token_pair(user["username"], user["role"])
+    return TokenPair(access_token=access_token, refresh_token=refresh_token)
 
 
-@router.post("/refresh", response_model=TokenPair)
+@router.post("/refresh", response_model=TokenPair, dependencies=[Depends(refresh_rate_limit)])
 def refresh(body: RefreshRequest) -> TokenPair:
     try:
         access_token, refresh_token = rotate_refresh_token(body.refresh_token)
@@ -60,7 +90,7 @@ def refresh(body: RefreshRequest) -> TokenPair:
     return TokenPair(access_token=access_token, refresh_token=refresh_token)
 
 
-@router.post("/logout")
+@router.post("/logout", dependencies=[Depends(logout_rate_limit)])
 def logout(body: LogoutRequest, user: dict = Depends(current_user)) -> dict:
     """登出：当前访问令牌与提交的刷新令牌同时立刻失效。"""
     token_store.revoke_access(user["jti"])
@@ -72,7 +102,7 @@ def logout(body: LogoutRequest, user: dict = Depends(current_user)) -> dict:
     return {"detail": "logged_out"}
 
 
-@router.post("/revoke")
+@router.post("/revoke", dependencies=[Depends(revoke_rate_limit)])
 def revoke(body: RefreshRequest, user: dict = Depends(current_user)) -> dict:
     """主动撤销指定刷新令牌（需持有有效访问令牌）。"""
     try:
@@ -82,3 +112,14 @@ def revoke(body: RefreshRequest, user: dict = Depends(current_user)) -> dict:
             status_code=401, detail={"code": exc.code, "message": str(exc)}
         ) from None
     return {"detail": "revoked"}
+
+
+@router.post("/revoke-all", dependencies=[Depends(revoke_rate_limit)])
+def revoke_all(user: dict = Depends(current_user)) -> dict:
+    """全端撤销：本账号此前签发的全部令牌（含各会话链后继）立即失效。
+
+    用于改密码或怀疑令牌泄露的场景；不影响其他账号，
+    之后重新登录可正常拿到新令牌。
+    """
+    token_store.revoke_all_for_user(user["sub"])
+    return {"detail": "all_tokens_revoked"}

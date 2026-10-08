@@ -13,11 +13,25 @@ _bearer = HTTPBearer(auto_error=False)
 
 
 def client_source(request: Request) -> str:
-    """限流口径里的"来源"：优先 X-Forwarded-For 首跳，否则直连 IP。"""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """限流判定使用的"来源"。
+
+    口径：只认真实 TCP 连接对端；只有当直连对端属于 config.TRUSTED_PROXIES
+    时，才采纳 X-Forwarded-For，并且取最右侧（离对端最近、由可信代理写入）
+    的、非可信代理的一跳。请求体/请求头里客户端自报的任何其它信息
+    （X-Real-IP、From 等）一律不参与判定，无法据此伪造或绕过来源。
+    """
+    peer = request.client.host if request.client else "unknown"
+    if peer not in config.TRUSTED_PROXIES:
+        return peer
+    forwarded = request.headers.get("x-forwarded-for", "")
+    chain = [part.strip() for part in forwarded.split(",") if part.strip()]
+    if not chain:
+        return peer
+    # 从右向左跳过可信代理自身写入的地址，第一个非可信地址才是真实来源
+    for hop in reversed(chain):
+        if hop not in config.TRUSTED_PROXIES:
+            return hop
+    return chain[-1]
 
 
 def rate_limit(bucket: str, limit: int, window: int):
@@ -40,11 +54,35 @@ def rate_limit(bucket: str, limit: int, window: int):
     return dependency
 
 
+# 认证类入口：各自独立的桶
 login_rate_limit = rate_limit(
-    "login", config.LOGIN_RATE_LIMIT_MAX, config.LOGIN_RATE_LIMIT_WINDOW
+    "auth:login", config.LOGIN_RATE_LIMIT_MAX, config.LOGIN_RATE_LIMIT_WINDOW
 )
-api_rate_limit = rate_limit(
-    "api", config.API_RATE_LIMIT_MAX, config.API_RATE_LIMIT_WINDOW
+refresh_rate_limit = rate_limit(
+    "auth:refresh", config.REFRESH_RATE_LIMIT_MAX, config.REFRESH_RATE_LIMIT_WINDOW
+)
+logout_rate_limit = rate_limit(
+    "auth:logout", config.LOGOUT_RATE_LIMIT_MAX, config.LOGOUT_RATE_LIMIT_WINDOW
+)
+revoke_rate_limit = rate_limit(
+    "auth:revoke", config.REVOKE_RATE_LIMIT_MAX, config.REVOKE_RATE_LIMIT_WINDOW
+)
+
+# 文档资源入口：读 / 写 / 管理三个桶
+documents_read_rate_limit = rate_limit(
+    "documents:read",
+    config.DOCUMENTS_READ_RATE_LIMIT_MAX,
+    config.DOCUMENTS_READ_RATE_LIMIT_WINDOW,
+)
+documents_write_rate_limit = rate_limit(
+    "documents:write",
+    config.DOCUMENTS_WRITE_RATE_LIMIT_MAX,
+    config.DOCUMENTS_WRITE_RATE_LIMIT_WINDOW,
+)
+documents_manage_rate_limit = rate_limit(
+    "documents:manage",
+    config.DOCUMENTS_MANAGE_RATE_LIMIT_MAX,
+    config.DOCUMENTS_MANAGE_RATE_LIMIT_WINDOW,
 )
 
 

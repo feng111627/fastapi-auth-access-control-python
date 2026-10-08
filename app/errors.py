@@ -23,6 +23,18 @@ class RefreshTokenReused(AuthError):
     code = "refresh_token_reused"
 
 
+class SessionCompromised(AuthError):
+    """同一刷新链上的旧令牌被复用，整条会话链已按疑似泄露作废。"""
+
+    code = "session_compromised"
+
+
+class AccountLocked(AuthError):
+    """账号因连续登录失败被临时锁定。"""
+
+    code = "account_locked"
+
+
 class InvalidCredentials(AuthError):
     code = "invalid_credentials"
 
